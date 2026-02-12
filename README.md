@@ -5,7 +5,9 @@
 </div>
 <br/>
 
-`yknotify` watches macOS logs (via `log stream` CLI command) for events that I've determined, through trial and error, are heuristically associated with the YubiKey waiting for touch. I primarily use the FIDO2 and OpenPGP features and haven't tested other applications listed in `ykman info` (e.g., Yubico OTP, FIDO U2F, OATH, PIV, YubiHSM Auth).
+> **Fork of [noperator/yknotify](https://github.com/noperator/yknotify).** The original runs as a single LaunchAgent, which requires the user to have persistent admin group membership because `log stream` needs it. This fork splits into a root LaunchDaemon (log monitor) and a user LaunchAgent (notifier) so the user account can run without admin privileges — useful when following least privilege with tools like [SAP Privileges](https://github.com/SAP/macOS-enterprise-privileges). The original binary also silently exits 0 when `log stream` fails (stderr wasn't captured), making it hard to diagnose.
+
+`yknotify` watches macOS logs (via `log stream` CLI command) for events that are heuristically associated with the YubiKey waiting for touch. Tested with FIDO2 and OpenPGP features; other applications listed in `ykman info` (e.g., Yubico OTP, FIDO U2F, OATH, PIV, YubiHSM Auth) have not been tested.
 
 When waiting for FIDO2 touch, we'll see this message logged once (with example hex value):
 
@@ -27,15 +29,59 @@ When you've tied your YubiKey to many things (SSH, Git signing, GPG, sudo, etc.)
 
 We ain't training Pavlovian doggies here. Touching your YubiKey should always be an intentful act, and `yknotify` doesn't change that. It's simply a more noticeable version of the YubiKey's flashing green LED.
 
-### Install
+### Architecture
+
+This fork splits `yknotify` into two services communicating via a named pipe (FIFO):
 
 ```
-go install github.com/noperator/yknotify@latest
+LaunchDaemon (root)                    LaunchAgent (user)
+yknotify -fifo /var/run/…   ──FIFO──▶  yknotify.sh
+  └─ log stream (needs root)              └─ terminal-notifier
+```
+
+- **Daemon** runs as root, monitors `log stream`, writes touch events to the FIFO
+- **Agent** runs as the user, reads events from the FIFO, sends desktop notifications
+- If either side restarts, the other reconnects automatically
+
+### Install
+
+```bash
+# Clone and build
+git clone https://github.com/stuartsaunders/yknotify
+cd yknotify
+go build -o yknotify .
+
+# Install dependencies
+brew install terminal-notifier jq
+
+# Install binary, script, and icon (requires sudo)
+sudo cp yknotify /usr/local/bin/yknotify
+sudo chmod 755 /usr/local/bin/yknotify
+sudo mkdir -p /usr/local/share/yknotify
+sudo cp yknotify.sh /usr/local/share/yknotify/yknotify.sh
+sudo chmod 755 /usr/local/share/yknotify/yknotify.sh
+sudo cp yubikey.png /usr/local/share/yknotify/yubikey.png
+
+# Install custom notification sound
+mkdir -p ~/Library/Sounds
+cp waiting.aiff ~/Library/Sounds/
+
+# Install LaunchDaemon (root log monitor)
+sudo cp com.yknotify.daemon.plist /Library/LaunchDaemons/
+sudo chown root:wheel /Library/LaunchDaemons/com.yknotify.daemon.plist
+sudo chmod 644 /Library/LaunchDaemons/com.yknotify.daemon.plist
+
+# Install LaunchAgent (user notifier)
+cp com.user.yknotify.agent.plist ~/Library/LaunchAgents/
+
+# Start services
+sudo launchctl bootstrap system /Library/LaunchDaemons/com.yknotify.daemon.plist
+launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.user.yknotify.agent.plist
 ```
 
 ### Usage
 
-Run from CLI.
+Run from CLI (no root required for testing, but `log stream` may fail without admin).
 
 ```
 yknotify
@@ -43,23 +89,50 @@ yknotify
 {"ts":"2025-02-12T20:09:14Z","type":"OpenPGP"}
 ```
 
-Run as LaunchAgent logging to Notification Center.
+### Testing
 
+Inject a fake event into the FIFO to verify the notification pipeline end-to-end:
+
+```bash
+# Stop the daemon so we can write to the FIFO directly
+sudo launchctl bootout system/com.yknotify.daemon
+
+# Send a test event (should trigger a desktop notification)
+echo '{"ts":"2026-01-01T00:00:00Z","type":"FIDO2"}' | sudo tee /var/run/yknotify.fifo
+
+# Restart the daemon
+sudo launchctl bootstrap system /Library/LaunchDaemons/com.yknotify.daemon.plist
 ```
-git clone https://github.com/noperator/yknotify
-cd yknotify
 
-# Enable terminal-based Notification Center messages
-brew install terminal-notifier
+Then trigger a real YubiKey operation (SSH, git sign, etc.) to confirm the full path works.
 
-# Install agent files
-sed -i .bu -E "s/<USER>/$USER/g" yknotify.sh com.user.yknotify.plist
-cp yknotify.sh "$HOME/"
-cp com.user.yknotify.plist "$HOME/Library/LaunchAgents/"
+### Verify
 
-# Load + start service
-launchctl load "$HOME/Library/LaunchAgents/com.user.yknotify.plist"
-launchctl start com.user.yknotify
+```bash
+# Check both services are running
+sudo launchctl print system/com.yknotify.daemon | grep -E "state|pid"
+launchctl print gui/$(id -u)/com.user.yknotify.agent | grep -E "state|pid"
+
+# FIFO exists?
+ls -la /var/run/yknotify.fifo
+
+# Check error logs
+sudo cat /var/log/yknotify-daemon.err
+cat /tmp/yknotify-agent.err
+```
+
+### Uninstall
+
+```bash
+# Stop services
+sudo launchctl bootout system/com.yknotify.daemon
+launchctl bootout gui/$(id -u)/com.user.yknotify.agent
+
+# Remove files
+sudo rm /Library/LaunchDaemons/com.yknotify.daemon.plist
+rm ~/Library/LaunchAgents/com.user.yknotify.agent.plist
+sudo rm -rf /usr/local/bin/yknotify /usr/local/share/yknotify
+sudo rm -f /var/run/yknotify.fifo
 ```
 
 ### Troubleshooting
