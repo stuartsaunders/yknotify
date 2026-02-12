@@ -1,31 +1,37 @@
 #!/bin/bash
 
+# Ensure Homebrew binaries (jq, terminal-notifier) are available under launchd
+export PATH="/opt/homebrew/bin:$PATH"
+
 # List of sounds: https://apple.stackexchange.com/a/479714
 
-# Adjust as needed
-YKNTFY_BIN="/Users/<USER>/go/bin/yknotify"
+FIFO="/var/run/yknotify.fifo"
+ICON="/usr/local/share/yknotify/yubikey.png"
 
-# brew install terminal-notifier
-TERM_NTFY_BIN="/opt/homebrew/bin/terminal-notifier"
+while true; do
+  # Wait for the FIFO to exist (daemon may not have started yet)
+  while [[ ! -p "$FIFO" ]]; do
+    sleep 1
+  done
 
-# Stream yknotify output and process each line
-LAST_NTFY=0
-while IFS= read -r line; do
+  # Read events from the FIFO; loop exits on EOF (daemon restart / FIFO broken)
+  while IFS= read -r line; do
 
-    # 2-second delay between notifications
-    NOW="$(date +%s)"
-    if [[ "$NOW" -le "$((LAST_NTFY + 2))" ]]; then
-        continue
-    fi
-    LAST_NTFY="$NOW"
-
-    # Send notification using terminal-notifier
+    # Send notification
     message="$(echo "$line" | jq -r '.type')"
-    if [[ -x "$TERM_NTFY_BIN" ]]; then
-        "$TERM_NTFY_BIN" -title "yknotify" -message "$message" -sound Submarine
+    if command -v terminal-notifier >/dev/null 2>&1; then
+      terminal-notifier \
+        -group "yknotify" \
+        -title "yknotify" \
+        -message "$message" \
+        -contentImage "$ICON" \
+        -sound "waiting"
     else
-        # Fallback to AppleScript if terminal-notifier is not installed
-        osascript -e "display notification \"$message\" with title \"yknotify\""
+      osascript -e "display notification \"$message\" with title \"yknotify\""
     fi
 
-done < <("$YKNTFY_BIN")
+  done < "$FIFO"
+
+  # Reader got EOF — daemon probably restarted; retry after a short pause
+  sleep 1
+done
