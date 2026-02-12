@@ -15,7 +15,12 @@ import (
 	"time"
 )
 
-const defaultPredicate = `(processImagePath == "/kernel" AND senderImagePath ENDSWITH "IOHIDFamily") OR (subsystem CONTAINS "CryptoTokenKit")`
+const (
+	defaultPredicate = `(processImagePath == "/kernel" AND senderImagePath ENDSWITH "IOHIDFamily") OR (subsystem CONTAINS "CryptoTokenKit")`
+
+	// FIDO2 CTAP2 user presence timeout
+	fido2Timeout = 30 * time.Second
+)
 
 var (
 	predicate = flag.String("predicate", defaultPredicate, "NSPredicate filter for log stream")
@@ -32,6 +37,7 @@ type LogEntry struct {
 
 type TouchState struct {
 	fido2Needed   bool
+	fido2Since    time.Time
 	openPGPNeeded bool
 	lastNotify    time.Time
 	output        io.Writer
@@ -49,6 +55,12 @@ func (ts *TouchState) checkAndNotify() {
 	}
 
 	now := time.Now()
+
+	// Auto-clear stale FIDO2 state (CTAP2 times out after 30s)
+	if ts.fido2Needed && now.Sub(ts.fido2Since) > fido2Timeout {
+		ts.fido2Needed = false
+	}
+
 	if now.Sub(ts.lastNotify) < 5*time.Second {
 		return
 	}
@@ -78,6 +90,38 @@ func (ts *TouchState) checkAndNotify() {
 		}
 	}
 	ts.lastNotify = now
+}
+
+// isYubiKeyDevice checks whether an IORegistry device ID belongs to a Yubico
+// device by looking up its Manufacturer property via ioreg.
+func isYubiKeyDevice(deviceID string) bool {
+	out, err := exec.Command("ioreg", "-r", "-l", "-c", "AppleUserUSBHostHIDDevice").Output()
+	if err != nil {
+		log.Printf("ioreg lookup failed: %v", err)
+		return false
+	}
+
+	// Parse ioreg output. Device blocks start with "+-o AppleUserUSBHostHIDDevice"
+	// lines containing "id 0x<hex>". We match on the device's registry ID and
+	// check for "Manufacturer" = "Yubico" within that block.
+	lines := strings.Split(string(out), "\n")
+	inTargetDevice := false
+	for _, line := range lines {
+		trimmed := strings.TrimSpace(line)
+
+		// New device block — match "id <deviceID>" in the header
+		// e.g., +-o AppleUserUSBHostHIDDevice  <class ..., id 0x10002e356, ...>
+		if strings.HasPrefix(trimmed, "+-o ") {
+			inTargetDevice = strings.Contains(trimmed, "id "+deviceID+",")
+			continue
+		}
+
+		if inTargetDevice && strings.Contains(trimmed, "\"Manufacturer\"") {
+			return strings.Contains(trimmed, "\"Yubico\"")
+		}
+	}
+
+	return false
 }
 
 // openFifo creates the FIFO if it doesn't exist and opens it for writing.
@@ -141,12 +185,20 @@ func streamLogs(output io.Writer) error {
 			msg := entry.EventMessage
 
 			// e.g., AppleUserUSBHostHIDDevice:0x100000c81 open by IOHIDLibUserClient:0x10016f869 (0x1)
-			// Other HID types (e.g., AppleUSBTopCaseHIDDriver) do not correspond to YubiKey and will trigger a false positive.
+			// Only track clients for confirmed YubiKey devices (vendor ID 0x1050).
 			if strings.Contains(msg, "AppleUserUSBHostHIDDevice:") && strings.Contains(msg, "open by IOHIDLibUserClient:") {
-				parts := strings.Split(msg, " open by ")
-				if len(parts) == 2 {
-					clientID := strings.Split(parts[1], " ")[0]
-					yubiKeyClients[clientID] = true
+				// Extract device ID (e.g., "0x100000c81") and client ID
+				devicePart := strings.SplitN(msg, " open by ", 2)
+				if len(devicePart) == 2 {
+					deviceID := strings.TrimPrefix(devicePart[0], "AppleUserUSBHostHIDDevice:")
+					clientID := strings.Split(devicePart[1], " ")[0]
+
+					if isYubiKeyDevice(deviceID) {
+						yubiKeyClients[clientID] = true
+						log.Printf("tracked YubiKey HID client %s (device %s)", clientID, deviceID)
+					} else {
+						log.Printf("ignored non-YubiKey HID device %s", deviceID)
+					}
 				}
 			}
 
@@ -154,7 +206,10 @@ func streamLogs(output io.Writer) error {
 			// Only trigger FIDO2 for tracked YubiKey clients.
 			if strings.HasSuffix(msg, "startQueue") {
 				clientID := strings.Split(msg, " ")[0]
-				state.fido2Needed = yubiKeyClients[clientID]
+				if yubiKeyClients[clientID] {
+					state.fido2Needed = true
+					state.fido2Since = time.Now()
+				}
 			} else if strings.HasSuffix(msg, "stopQueue") {
 				clientID := strings.Split(msg, " ")[0]
 				if yubiKeyClients[clientID] {
