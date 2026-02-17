@@ -11,6 +11,7 @@ import (
 	"os/exec"
 	"os/signal"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 )
@@ -36,6 +37,7 @@ type LogEntry struct {
 }
 
 type TouchState struct {
+	mu            sync.Mutex
 	fido2Needed   bool
 	fido2Since    time.Time
 	openPGPNeeded bool
@@ -50,6 +52,9 @@ type TouchEvent struct {
 }
 
 func (ts *TouchState) checkAndNotify() {
+	ts.mu.Lock()
+	defer ts.mu.Unlock()
+
 	if ts.writeErr != nil {
 		return
 	}
@@ -169,9 +174,12 @@ func streamLogs(output io.Writer) error {
 
 	for scanner.Scan() {
 		// If a write to the FIFO failed, stop processing
-		if state.writeErr != nil {
+		state.mu.Lock()
+		writeErr := state.writeErr
+		state.mu.Unlock()
+		if writeErr != nil {
 			_ = cmd.Process.Kill()
-			return state.writeErr
+			return writeErr
 		}
 
 		var entry LogEntry
@@ -207,19 +215,25 @@ func streamLogs(output io.Writer) error {
 			if strings.HasSuffix(msg, "startQueue") {
 				clientID := strings.Split(msg, " ")[0]
 				if yubiKeyClients[clientID] {
+					state.mu.Lock()
 					state.fido2Needed = true
 					state.fido2Since = time.Now()
+					state.mu.Unlock()
 				}
 			} else if strings.HasSuffix(msg, "stopQueue") {
 				clientID := strings.Split(msg, " ")[0]
 				if yubiKeyClients[clientID] {
+					state.mu.Lock()
 					state.fido2Needed = false
+					state.mu.Unlock()
 				}
 			}
 
 		case strings.HasSuffix(entry.ProcessImagePath, "usbsmartcardreaderd") &&
 			strings.HasSuffix(entry.Subsystem, "CryptoTokenKit"):
+			state.mu.Lock()
 			state.openPGPNeeded = entry.EventMessage == "Time extension received"
+			state.mu.Unlock()
 		}
 		state.checkAndNotify()
 	}
@@ -227,6 +241,8 @@ func streamLogs(output io.Writer) error {
 	if err := scanner.Err(); err != nil {
 		return err
 	}
+	state.mu.Lock()
+	defer state.mu.Unlock()
 	return state.writeErr
 }
 
