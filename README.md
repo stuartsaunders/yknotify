@@ -116,9 +116,8 @@ launchctl print gui/$(id -u)/com.user.yknotify.agent | grep -E "state|pid"
 # FIFO exists?
 ls -la /var/run/yknotify.fifo
 
-# Check error logs
-sudo cat /var/log/yknotify-daemon.err
-cat /tmp/yknotify-agent.err
+# Check daemon log
+sudo cat /var/log/yknotify-daemon.log
 ```
 
 ### Uninstall

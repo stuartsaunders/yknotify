@@ -15,6 +15,6 @@
     <key>KeepAlive</key>
     <true/>
     <key>StandardErrorPath</key>
-    <string>/var/log/yknotify-daemon.err</string>
+    <string>/var/log/yknotify-daemon.log</string>
 </dict>
 </plist>
