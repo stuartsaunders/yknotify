@@ -97,9 +97,16 @@ func (ts *TouchState) checkAndNotify() {
 	ts.lastNotify = now
 }
 
-// isYubiKeyDevice checks whether an IORegistry device ID belongs to a Yubico
-// device by looking up its Manufacturer property via ioreg.
-func isYubiKeyDevice(deviceID string) bool {
+// isYubiKeyFIDO2Device checks whether an IORegistry device ID belongs to a
+// Yubico FIDO2 HID interface. It requires both:
+//   - "Manufacturer" = "Yubico" (rules out non-YubiKey USB HID devices)
+//   - "PrimaryUsagePage" = 61904 (0xF1D0, FIDO Alliance usage page)
+//
+// The second check is critical: a YubiKey exposes multiple HID interfaces
+// (keyboard/OTP on usage page 1, FIDO2 on usage page 0xF1D0). Input managers
+// like BetterTouchTool open the keyboard interface and call startQueue as part
+// of normal HID setup — tracking those clients would cause false positives.
+func isYubiKeyFIDO2Device(deviceID string) bool {
 	out, err := exec.Command("ioreg", "-r", "-l", "-c", "AppleUserUSBHostHIDDevice").Output()
 	if err != nil {
 		log.Printf("ioreg lookup failed: %v", err)
@@ -108,21 +115,39 @@ func isYubiKeyDevice(deviceID string) bool {
 
 	// Parse ioreg output. Device blocks start with "+-o AppleUserUSBHostHIDDevice"
 	// lines containing "id 0x<hex>". We match on the device's registry ID and
-	// check for "Manufacturer" = "Yubico" within that block.
+	// check for both "Manufacturer" = "Yubico" and "PrimaryUsagePage" = 61904
+	// within that block.
+	const fido2UsagePage = 61904 // 0xF1D0 — FIDO Alliance
 	lines := strings.Split(string(out), "\n")
 	inTargetDevice := false
+	isYubico := false
+	isFIDO2 := false
 	for _, line := range lines {
 		trimmed := strings.TrimSpace(line)
 
-		// New device block — match "id <deviceID>" in the header
+		// New device block — match "id <deviceID>" in the header.
 		// e.g., +-o AppleUserUSBHostHIDDevice  <class ..., id 0x10002e356, ...>
 		if strings.HasPrefix(trimmed, "+-o ") {
+			if inTargetDevice {
+				// We've exited the target block without finding both conditions.
+				break
+			}
 			inTargetDevice = strings.Contains(trimmed, "id "+deviceID+",")
 			continue
 		}
 
-		if inTargetDevice && strings.Contains(trimmed, "\"Manufacturer\"") {
-			return strings.Contains(trimmed, "\"Yubico\"")
+		if !inTargetDevice {
+			continue
+		}
+
+		if strings.Contains(trimmed, "\"Manufacturer\"") {
+			isYubico = strings.Contains(trimmed, "\"Yubico\"")
+		}
+		if strings.Contains(trimmed, "\"PrimaryUsagePage\"") {
+			isFIDO2 = strings.Contains(trimmed, fmt.Sprintf("= %d", fido2UsagePage))
+		}
+		if isYubico && isFIDO2 {
+			return true
 		}
 	}
 
@@ -201,7 +226,7 @@ func streamLogs(output io.Writer) error {
 					deviceID := strings.TrimPrefix(devicePart[0], "AppleUserUSBHostHIDDevice:")
 					clientID := strings.Split(devicePart[1], " ")[0]
 
-					if isYubiKeyDevice(deviceID) {
+					if isYubiKeyFIDO2Device(deviceID) {
 						yubiKeyClients[clientID] = true
 						log.Printf("tracked YubiKey HID client %s (device %s)", clientID, deviceID)
 					} else {
