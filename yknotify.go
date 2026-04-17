@@ -19,8 +19,24 @@ import (
 const (
 	defaultPredicate = `(processImagePath == "/kernel" AND senderImagePath ENDSWITH "IOHIDFamily") OR (subsystem CONTAINS "CryptoTokenKit")`
 
-	// FIDO2 CTAP2 user presence timeout
+	// FIDO2 CTAP2 user presence timeout — real touch waits end within this
+	// window (either by touch, stopQueue from the client, or device timeout).
+	// Pending startQueues older than this are pruned as stuck state.
 	fido2Timeout = 30 * time.Second
+
+	// Grace period before a sustained startQueue is treated as a real touch
+	// wait. Legitimate enumeration / probe opens (plug-in, Yubico Authenticator
+	// reading device info) resolve in milliseconds with a matching stopQueue;
+	// real CTAP2 user-presence waits hold the queue open for seconds to tens
+	// of seconds. 1500ms is comfortably above probe duration and well below
+	// real touch latency.
+	fido2GracePeriod = 1500 * time.Millisecond
+
+	// Re-notify interval while a touch remains pending. The YubiKey LED blinks
+	// throughout but users often miss a single toast — a repeat every few
+	// seconds helps catch it. Capped implicitly by fido2Timeout and by the
+	// underlying operation's own CTAP2 timeout.
+	renotifyInterval = 5 * time.Second
 )
 
 var (
@@ -37,13 +53,21 @@ type LogEntry struct {
 }
 
 type TouchState struct {
-	mu            sync.Mutex
-	fido2Needed   bool
-	fido2Since    time.Time
-	openPGPNeeded bool
-	lastNotify    time.Time
-	output        io.Writer
-	writeErr      error
+	mu sync.Mutex
+	// Pending startQueue events keyed by IOHIDLibUserClient id. An entry is
+	// promoted to a FIDO2 touch notification only after fido2GracePeriod has
+	// elapsed without a matching stopQueue. This filters brief open+probe
+	// cycles from enumeration and device-info reads.
+	fido2Pending map[string]time.Time
+	// Last notification timestamps per type. Zero value means never notified
+	// for the current pending cycle; reset when the state transitions back
+	// to not-needed. Used to drive both the initial fire (on false→true) and
+	// re-fires every renotifyInterval while still pending.
+	fido2LastNotify   time.Time
+	openPGPNeeded     bool
+	openPGPLastNotify time.Time
+	output            io.Writer
+	writeErr          error
 }
 
 type TouchEvent struct {
@@ -51,6 +75,10 @@ type TouchEvent struct {
 	Type      string `json:"type"`
 }
 
+// checkAndNotify recomputes pending state and fires a notification on the
+// false→true transition, then re-fires every renotifyInterval while the
+// touch remains pending. Repeats stop as soon as the pending state clears
+// (stopQueue from the client, or the CTAP2 timeout prune).
 func (ts *TouchState) checkAndNotify() {
 	ts.mu.Lock()
 	defer ts.mu.Unlock()
@@ -61,40 +89,65 @@ func (ts *TouchState) checkAndNotify() {
 
 	now := time.Now()
 
-	// Auto-clear stale FIDO2 state (CTAP2 times out after 30s)
-	if ts.fido2Needed && now.Sub(ts.fido2Since) > fido2Timeout {
-		ts.fido2Needed = false
+	// Prune pending entries older than CTAP2 timeout. A stuck entry without a
+	// matching stopQueue (e.g. process crashed holding the queue open) would
+	// otherwise keep re-firing long past any possible real touch.
+	for id, t := range ts.fido2Pending {
+		if now.Sub(t) > fido2Timeout {
+			delete(ts.fido2Pending, id)
+		}
 	}
 
-	if now.Sub(ts.lastNotify) < 5*time.Second {
-		return
+	// A pending entry older than fido2GracePeriod is a real touch wait.
+	fido2Needed := false
+	for _, t := range ts.fido2Pending {
+		if now.Sub(t) >= fido2GracePeriod {
+			fido2Needed = true
+			break
+		}
 	}
 
-	if ts.fido2Needed {
-		event := TouchEvent{
-			Type:      "FIDO2",
-			Timestamp: now.UTC().Format(time.RFC3339),
-		}
-		if bytes, err := json.Marshal(event); err == nil {
-			if _, err := fmt.Fprintln(ts.output, string(bytes)); err != nil {
-				ts.writeErr = err
-				return
-			}
-		}
+	// Reset re-notify timer when state transitions back to not-needed, so the
+	// next pending cycle fires immediately rather than waiting out the interval.
+	if !fido2Needed {
+		ts.fido2LastNotify = time.Time{}
 	}
-	if ts.openPGPNeeded {
-		event := TouchEvent{
-			Type:      "OpenPGP",
-			Timestamp: now.UTC().Format(time.RFC3339),
-		}
-		if bytes, err := json.Marshal(event); err == nil {
-			if _, err := fmt.Fprintln(ts.output, string(bytes)); err != nil {
-				ts.writeErr = err
-				return
-			}
-		}
+	if !ts.openPGPNeeded {
+		ts.openPGPLastNotify = time.Time{}
 	}
-	ts.lastNotify = now
+
+	if fido2Needed && (ts.fido2LastNotify.IsZero() || now.Sub(ts.fido2LastNotify) >= renotifyInterval) {
+		log.Printf("notifying FIDO2 (pending=%d)", len(ts.fido2Pending))
+		if err := ts.writeEvent(now, "FIDO2"); err != nil {
+			return
+		}
+		ts.fido2LastNotify = now
+	}
+	if ts.openPGPNeeded && (ts.openPGPLastNotify.IsZero() || now.Sub(ts.openPGPLastNotify) >= renotifyInterval) {
+		if err := ts.writeEvent(now, "OpenPGP"); err != nil {
+			return
+		}
+		ts.openPGPLastNotify = now
+	}
+}
+
+// writeEvent marshals and writes a TouchEvent. Caller must hold ts.mu.
+// On write failure the error is stored on the state so the scanner loop can
+// unwind cleanly (typically: reader disconnected from the FIFO).
+func (ts *TouchState) writeEvent(now time.Time, kind string) error {
+	event := TouchEvent{
+		Type:      kind,
+		Timestamp: now.UTC().Format(time.RFC3339),
+	}
+	bytes, err := json.Marshal(event)
+	if err != nil {
+		return err
+	}
+	if _, err := fmt.Fprintln(ts.output, string(bytes)); err != nil {
+		ts.writeErr = err
+		return err
+	}
+	return nil
 }
 
 // isYubiKeyFIDO2Device checks whether an IORegistry device ID belongs to a
@@ -154,6 +207,73 @@ func isYubiKeyFIDO2Device(deviceID string) bool {
 	return false
 }
 
+// hidClientCreator returns the IOUserClientCreator string for a given
+// IOHIDLibUserClient registry id, or "" if the entry cannot be found.
+//
+// The creator string looks like: "pid 12345, Yubico Authenticator" — it's
+// the creating process's argv[0] as seen by IOKit when the user client was
+// instantiated. We use it for process-aware suppression without needing to
+// invoke `ps` or `lsof`.
+func hidClientCreator(clientID string) string {
+	// Kernel log uses "IOHIDLibUserClient:0x..." as the clientID; ioreg prints
+	// "id 0x..." without the class prefix. Strip to the bare hex id.
+	bareID := clientID
+	if i := strings.LastIndex(bareID, ":"); i >= 0 {
+		bareID = bareID[i+1:]
+	}
+	out, err := exec.Command("ioreg", "-c", "IOHIDLibUserClient", "-l", "-r", "-w", "0").Output()
+	if err != nil {
+		return ""
+	}
+	lines := strings.Split(string(out), "\n")
+	inTarget := false
+	for _, line := range lines {
+		trimmed := strings.TrimSpace(line)
+		if strings.HasPrefix(trimmed, "+-o ") {
+			if inTarget {
+				// Exited the target block without finding the property.
+				break
+			}
+			inTarget = strings.Contains(trimmed, "id "+bareID+",")
+			continue
+		}
+		if inTarget && strings.Contains(trimmed, "\"IOUserClientCreator\"") {
+			// e.g.  "IOUserClientCreator" = "pid 12345, <argv0>"
+			if eq := strings.Index(trimmed, "= "); eq >= 0 {
+				return strings.Trim(trimmed[eq+2:], "\"")
+			}
+		}
+	}
+	return ""
+}
+
+// touchlessFIDO2Apps lists argv[0] substrings of processes that open the
+// FIDO2 HID interface for non-touch reasons (device info, client-PIN entry,
+// credential enumeration). Yubico Authenticator's "Accounts" and "Passkeys"
+// tabs send CTAP2 clientPIN commands and hold startQueue open for the
+// duration of the PIN prompt — which from the log signal alone is
+// indistinguishable from a real user-presence wait.
+var touchlessFIDO2Apps = []string{
+	"yubico authenticator",
+	"authenticator-he", // Yubico Authenticator helper (ioreg truncates the binary name)
+	"ykman",
+}
+
+// isTouchlessFIDO2Client matches the IOUserClientCreator string against
+// known touchless apps. Case-insensitive substring match.
+func isTouchlessFIDO2Client(creator string) bool {
+	if creator == "" {
+		return false
+	}
+	lower := strings.ToLower(creator)
+	for _, app := range touchlessFIDO2Apps {
+		if strings.Contains(lower, app) {
+			return true
+		}
+	}
+	return false
+}
+
 // openFifo creates the FIFO if it doesn't exist and opens it for writing.
 // The open blocks until a reader connects — this is intentional.
 func openFifo(path string) (*os.File, error) {
@@ -186,7 +306,10 @@ func streamLogs(output io.Writer) error {
 		return err
 	}
 
-	state := &TouchState{output: output}
+	state := &TouchState{
+		output:       output,
+		fido2Pending: make(map[string]time.Time),
+	}
 	scanner := bufio.NewScanner(stdout)
 	yubiKeyClients := make(map[string]bool)
 
@@ -227,8 +350,13 @@ func streamLogs(output io.Writer) error {
 					clientID := strings.Split(devicePart[1], " ")[0]
 
 					if isYubiKeyFIDO2Device(deviceID) {
-						yubiKeyClients[clientID] = true
-						log.Printf("tracked YubiKey HID client %s (device %s)", clientID, deviceID)
+						creator := hidClientCreator(clientID)
+						if isTouchlessFIDO2Client(creator) {
+							log.Printf("ignored touchless FIDO2 client %s (creator %q)", clientID, creator)
+						} else {
+							yubiKeyClients[clientID] = true
+							log.Printf("tracked YubiKey HID client %s (device %s, creator %q)", clientID, deviceID, creator)
+						}
 					} else {
 						log.Printf("ignored non-YubiKey HID device %s", deviceID)
 					}
@@ -236,21 +364,29 @@ func streamLogs(output io.Writer) error {
 			}
 
 			// e.g., IOHIDLibUserClient:0x10016f869 startQueue
-			// Only trigger FIDO2 for tracked YubiKey clients.
+			// Record pending; checkAndNotify promotes to a notification only
+			// if fido2GracePeriod elapses without a matching stopQueue.
 			if strings.HasSuffix(msg, "startQueue") {
 				clientID := strings.Split(msg, " ")[0]
-				if yubiKeyClients[clientID] {
+				tracked := yubiKeyClients[clientID]
+				log.Printf("startQueue %s tracked=%v", clientID, tracked)
+				if tracked {
 					state.mu.Lock()
-					state.fido2Needed = true
-					state.fido2Since = time.Now()
+					state.fido2Pending[clientID] = time.Now()
 					state.mu.Unlock()
 				}
 			} else if strings.HasSuffix(msg, "stopQueue") {
 				clientID := strings.Split(msg, " ")[0]
-				if yubiKeyClients[clientID] {
+				tracked := yubiKeyClients[clientID]
+				if tracked {
 					state.mu.Lock()
-					state.fido2Needed = false
+					age := time.Duration(0)
+					if t, ok := state.fido2Pending[clientID]; ok {
+						age = time.Since(t)
+					}
+					delete(state.fido2Pending, clientID)
 					state.mu.Unlock()
+					log.Printf("stopQueue %s tracked=true pending_age=%v", clientID, age)
 				}
 			}
 
